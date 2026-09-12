@@ -9,9 +9,7 @@ build/
 node_modules/
 
 # Environment
-.env
 .env.local
-.env.*
 
 # Editors
 .vscode/
@@ -68,7 +66,3 @@ htmlcov/
 .gradle/
 target/
 ```
-.env
-.env.*
-whatsapp-session/
-whatsapp-session.invalid.*/
