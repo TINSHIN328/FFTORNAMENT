@@ -68,3 +68,7 @@ htmlcov/
 .gradle/
 target/
 ```
+.env
+.env.*
+whatsapp-session/
+whatsapp-session.invalid.*/
