@@ -1,0 +1,662 @@
+import mysql from 'mysql2/promise';
+
+let pool: mysql.Pool | null = null;
+
+function parseDatabaseUrl(url: string) {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'mysql:') return null;
+    return {
+      host: parsed.hostname,
+      port: Number(parsed.port || 3306),
+      user: decodeURIComponent(parsed.username),
+      password: decodeURIComponent(parsed.password),
+      database: decodeURIComponent(parsed.pathname.replace(/^\//, '')),
+    };
+  } catch { return null; }
+}
+
+async function repairLegacyOAuthSchema(connection: mysql.PoolConnection): Promise<void> {
+  const [tables] = await connection.query<any[]>(
+    `SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'oauth_accounts'`
+  );
+  if (!Array.isArray(tables) || tables.length === 0) return;
+
+  const [fks] = await connection.query<any[]>(
+    `SELECT CONSTRAINT_NAME FROM information_schema.KEY_COLUMN_USAGE
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'oauth_accounts'
+       AND COLUMN_NAME = 'user_id' AND REFERENCED_TABLE_NAME = 'users'`
+  );
+  for (const fk of fks || []) {
+    await connection.query(`ALTER TABLE oauth_accounts DROP FOREIGN KEY \`${fk.CONSTRAINT_NAME}\``);
+  }
+  await connection.query(`ALTER TABLE oauth_accounts MODIFY COLUMN user_id VARCHAR(36) NOT NULL`);
+  try {
+    await connection.query(`ALTER TABLE oauth_accounts ADD CONSTRAINT oauth_accounts_user_fk FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE`);
+  } catch (error: any) {
+    if (!String(error?.message || '').toLowerCase().includes('duplicate')) throw error;
+  }
+}
+
+export async function connectDatabase(): Promise<mysql.Pool> {
+  let config: mysql.PoolOptions;
+
+  if (process.env.DATABASE_URL) {
+    const parsed = parseDatabaseUrl(process.env.DATABASE_URL);
+    if (!parsed) throw new Error('Invalid DATABASE_URL format');
+    config = { ...parsed, waitForConnections: true, connectionLimit: 10, queueLimit: 0 };
+  } else if (process.env.DB_HOST) {
+    config = {
+      host: process.env.DB_HOST,
+      port: parseInt(process.env.DB_PORT || '3306'),
+      user: process.env.DB_USER,
+      password: process.env.DB_PASSWORD,
+      database: process.env.DB_NAME,
+      waitForConnections: true,
+      connectionLimit: 10,
+      queueLimit: 0,
+    };
+  } else {
+    throw new Error('No database configuration found. Set DATABASE_URL or DB_HOST/DB_PORT/DB_USER/DB_PASSWORD/DB_NAME');
+  }
+
+  pool = mysql.createPool(config);
+  return pool;
+}
+
+export async function verifyConnection(): Promise<void> {
+  if (!pool) throw new Error('Database not initialized');
+  const connection = await pool.getConnection();
+  try {
+    await connection.ping();
+  } finally {
+    connection.release();
+  }
+}
+
+export function getPool(): mysql.Pool {
+  if (!pool) throw new Error('Database not connected');
+  return pool;
+}
+
+
+async function ensureColumn(connection: mysql.PoolConnection, table: string, column: string, definition: string) {
+  const [rows] = await connection.query<any[]>(
+    `SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ? LIMIT 1`,
+    [table, column]
+  );
+  if (!rows.length) await connection.query(`ALTER TABLE \`${table}\` ADD COLUMN \`${column}\` ${definition}`);
+}
+
+async function migrateTournamentParticipantsSchema(connection: mysql.PoolConnection): Promise<void> {
+  // Check if tournament_participants table exists
+  const [tables] = await connection.query<any[]>(
+    `SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tournament_participants'`
+  );
+  if (!Array.isArray(tables) || tables.length === 0) return; // Table doesn't exist yet, will be created by CREATE TABLE IF NOT EXISTS
+
+  // Check if team_id column exists
+  const [columns] = await connection.query<any[]>(
+    `SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tournament_participants' AND COLUMN_NAME = 'team_id'`
+  );
+  
+  if (columns.length > 0) {
+    console.log('[MIGRATE] Migrating tournament_participants table from team-based to individual-based...');
+    
+    // Drop foreign key constraint for team_id if it exists
+    const [fks] = await connection.query<any[]>(
+      `SELECT CONSTRAINT_NAME FROM information_schema.KEY_COLUMN_USAGE 
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tournament_participants' 
+       AND COLUMN_NAME = 'team_id' AND REFERENCED_TABLE_NAME IS NOT NULL`
+    );
+    for (const fk of fks || []) {
+      try {
+        await connection.query(`ALTER TABLE tournament_participants DROP FOREIGN KEY \`${fk.CONSTRAINT_NAME}\``);
+      } catch (error: any) {
+        if (!String(error?.message || '').toLowerCase().includes('doesn\'t exist')) throw error;
+      }
+    }
+    
+    // Add new teammate columns if they don't exist
+    await ensureColumn(connection, 'tournament_participants', 'teammate1_ign', 'VARCHAR(100) NULL');
+    await ensureColumn(connection, 'tournament_participants', 'teammate1_uid', 'VARCHAR(100) NULL');
+    await ensureColumn(connection, 'tournament_participants', 'teammate2_ign', 'VARCHAR(100) NULL');
+    await ensureColumn(connection, 'tournament_participants', 'teammate2_uid', 'VARCHAR(100) NULL');
+    await ensureColumn(connection, 'tournament_participants', 'teammate3_ign', 'VARCHAR(100) NULL');
+    await ensureColumn(connection, 'tournament_participants', 'teammate3_uid', 'VARCHAR(100) NULL');
+    
+    // Make ign, free_fire_uid, player_username NOT NULL with default empty string if needed
+    try {
+      await connection.query(`ALTER TABLE tournament_participants MODIFY COLUMN ign VARCHAR(100) NOT NULL DEFAULT ''`);
+      await connection.query(`ALTER TABLE tournament_participants MODIFY COLUMN free_fire_uid VARCHAR(100) NOT NULL DEFAULT ''`);
+      await connection.query(`ALTER TABLE tournament_participants MODIFY COLUMN player_username VARCHAR(100) NOT NULL DEFAULT ''`);
+    } catch (error: any) {
+      // Ignore errors about incompatible changes
+    }
+    
+    // Drop the unique key for team if it exists
+    try {
+      await connection.query(`ALTER TABLE tournament_participants DROP INDEX unique_tournament_team`);
+    } catch (error: any) {
+      if (!String(error?.message || '').toLowerCase().includes("doesn't exist")) throw error;
+    }
+    
+    // Drop the team_id column
+    try {
+      await connection.query(`ALTER TABLE tournament_participants DROP COLUMN team_id`);
+    } catch (error: any) {
+      if (!String(error?.message || '').toLowerCase().includes("doesn't exist")) throw error;
+    }
+    
+    console.log('[MIGRATE] tournament_participants table migrated successfully');
+  }
+}
+
+export async function runMigrations(): Promise<void> {
+  const pool = getPool();
+  const connection = await pool.getConnection();
+
+  try {
+    console.log('[MIGRATE] Running database migrations...');
+
+    // Existing Railway databases can contain an older oauth_accounts schema.
+    // Repair it before CREATE TABLE IF NOT EXISTS, otherwise MySQL keeps the old FK type.
+    await repairLegacyOAuthSchema(connection);
+
+    // Migrate tournament_participants table from team-based to individual-based
+    await migrateTournamentParticipantsSchema(connection);
+
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id VARCHAR(36) PRIMARY KEY,
+        google_id VARCHAR(255) UNIQUE,
+        email VARCHAR(255) UNIQUE NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        username VARCHAR(100) UNIQUE NOT NULL,
+        password_hash VARCHAR(255),
+        avatar_url TEXT,
+        role ENUM('USER', 'ADMIN', 'MODERATOR') DEFAULT 'USER',
+        status ENUM('ACTIVE', 'BANNED', 'SUSPENDED') DEFAULT 'ACTIVE',
+        bio TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        last_login TIMESTAMP NULL,
+        INDEX idx_email (email),
+        INDEX idx_username (username),
+        INDEX idx_role (role),
+        INDEX idx_status (status)
+      )
+    `);
+
+
+
+    // Wallet / coin system: 4 PKR = 1 coin. Balance is stored on the user row,
+    // while every purchase/withdrawal is recorded in an immutable transaction table.
+    await ensureColumn(connection, 'users', 'coins_balance', "DECIMAL(12,2) NOT NULL DEFAULT 0");
+    await ensureColumn(connection, 'users', 'phone_number', "VARCHAR(30) NULL");
+    await ensureColumn(connection, 'users', 'otp_login_enabled', "TINYINT(1) NOT NULL DEFAULT 1");
+    try { await connection.query(`CREATE UNIQUE INDEX idx_users_phone_unique ON users(phone_number)`); } catch (error: any) {
+      if (!String(error?.message || '').toLowerCase().includes('duplicate')) throw error;
+    }
+
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS coin_transactions (
+        id VARCHAR(36) PRIMARY KEY,
+        user_id VARCHAR(36) NOT NULL,
+        type ENUM('PURCHASE','WITHDRAWAL','ADJUSTMENT','TOURNAMENT_ENTRY','REFUND') NOT NULL,
+        coins DECIMAL(12,2) NOT NULL,
+        rupees DECIMAL(12,2) NOT NULL DEFAULT 0,
+        status ENUM('PENDING','APPROVED','REJECTED','COMPLETED') NOT NULL DEFAULT 'PENDING',
+        payment_method VARCHAR(50) NULL,
+        transaction_ref VARCHAR(255) NULL,
+        easypaisa_account VARCHAR(30) NULL,
+        note TEXT NULL,
+        reviewed_by VARCHAR(36) NULL,
+        reviewed_at TIMESTAMP NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        INDEX idx_coin_user (user_id),
+        INDEX idx_coin_status (status),
+        INDEX idx_coin_type (type)
+      )
+    `);
+
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS coin_withdrawals (
+        id VARCHAR(36) PRIMARY KEY,
+        transaction_id VARCHAR(36) NOT NULL,
+        user_id VARCHAR(36) NOT NULL,
+        coins DECIMAL(12,2) NOT NULL,
+        rupees DECIMAL(12,2) NOT NULL,
+        easypaisa_account VARCHAR(30) NOT NULL,
+        account_name VARCHAR(255) NULL,
+        status ENUM('PENDING','APPROVED','REJECTED','PAID') NOT NULL DEFAULT 'PENDING',
+        admin_note TEXT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        FOREIGN KEY (transaction_id) REFERENCES coin_transactions(id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        INDEX idx_withdraw_user (user_id),
+        INDEX idx_withdraw_status (status)
+      )
+    `);
+
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS coin_purchases (
+        id VARCHAR(36) PRIMARY KEY,
+        transaction_id VARCHAR(36) NOT NULL,
+        user_id VARCHAR(36) NOT NULL,
+        coins DECIMAL(12,2) NOT NULL,
+        rupees DECIMAL(12,2) NOT NULL,
+        easypaisa_account VARCHAR(30) NOT NULL,
+        sender_name VARCHAR(255) NULL,
+        transaction_ref VARCHAR(255) NOT NULL,
+        status ENUM('PENDING','APPROVED','REJECTED') NOT NULL DEFAULT 'PENDING',
+        admin_note TEXT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        FOREIGN KEY (transaction_id) REFERENCES coin_transactions(id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        INDEX idx_purchase_user (user_id),
+        INDEX idx_purchase_status (status)
+      )
+    `);
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS registration_otps (
+        id VARCHAR(36) PRIMARY KEY,
+        phone_number VARCHAR(30) NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        email VARCHAR(255) NOT NULL,
+        username VARCHAR(100) NOT NULL,
+        password_hash VARCHAR(255) NOT NULL,
+        code_hash VARCHAR(255) NOT NULL,
+        expires_at DATETIME NOT NULL,
+        attempts INT NOT NULL DEFAULT 0,
+        verified_at DATETIME NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_registration_otp_phone (phone_number),
+        INDEX idx_registration_otp_expires (expires_at)
+      )
+    `);
+
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS login_otps (
+        id VARCHAR(36) PRIMARY KEY,
+        user_id VARCHAR(36) NOT NULL,
+        phone_number VARCHAR(30) NOT NULL,
+        code_hash VARCHAR(255) NOT NULL,
+        expires_at DATETIME NOT NULL,
+        attempts INT NOT NULL DEFAULT 0,
+        verified_at DATETIME NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        INDEX idx_login_otp_user (user_id),
+        INDEX idx_login_otp_expires (expires_at)
+      )
+    `);
+
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS oauth_accounts (
+        id VARCHAR(36) PRIMARY KEY,
+        user_id VARCHAR(36) NOT NULL,
+        provider VARCHAR(50) NOT NULL,
+        provider_id VARCHAR(255) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY unique_provider_account (provider, provider_id),
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        INDEX idx_oauth_user (user_id)
+      )
+    `);
+
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS games (
+        id VARCHAR(36) PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        slug VARCHAR(255) UNIQUE NOT NULL,
+        icon VARCHAR(10),
+        banner TEXT,
+        description TEXT,
+        status ENUM('ACTIVE', 'INACTIVE') DEFAULT 'ACTIVE',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_slug (slug)
+      )
+    `);
+
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS teams (
+        id VARCHAR(36) PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        tag VARCHAR(10) NOT NULL,
+        logo TEXT,
+        description TEXT,
+        captain_id VARCHAR(36) NOT NULL,
+        status ENUM('ACTIVE', 'DISBANDED', 'INACTIVE') DEFAULT 'ACTIVE',
+        wins INT DEFAULT 0,
+        losses INT DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        FOREIGN KEY (captain_id) REFERENCES users(id) ON DELETE CASCADE,
+        INDEX idx_captain (captain_id),
+        INDEX idx_status (status)
+      )
+    `);
+
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS team_members (
+        id VARCHAR(36) PRIMARY KEY,
+        team_id VARCHAR(36) NOT NULL,
+        user_id VARCHAR(36) NOT NULL,
+        role ENUM('CAPTAIN', 'MEMBER', 'SUBSTITUTE') DEFAULT 'MEMBER',
+        joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        UNIQUE KEY unique_team_user (team_id, user_id)
+      )
+    `);
+
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS tournaments (
+        id VARCHAR(36) PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        slug VARCHAR(255) UNIQUE NOT NULL,
+        game_id VARCHAR(36) NOT NULL,
+        description TEXT,
+        banner_url TEXT,
+        logo_url TEXT,
+        prize_pool DECIMAL(10,2) DEFAULT 0,
+        currency VARCHAR(3) DEFAULT 'PKR',
+        entry_fee DECIMAL(10,2) DEFAULT 0,
+        max_teams INT DEFAULT 32,
+        max_players_per_team INT DEFAULT 4,
+        registration_start TIMESTAMP NOT NULL,
+        registration_end TIMESTAMP NOT NULL,
+        tournament_start TIMESTAMP NOT NULL,
+        region VARCHAR(100) DEFAULT 'Global',
+        platform VARCHAR(50) DEFAULT 'PC',
+        format ENUM('SINGLE_ELIMINATION', 'DOUBLE_ELIMINATION', 'ROUND_ROBIN', 'SWISS', 'LEAGUE', 'CUSTOM') DEFAULT 'SINGLE_ELIMINATION',
+        rules TEXT,
+        prize_distribution TEXT,
+        status ENUM('DRAFT', 'UPCOMING', 'REGISTRATION_OPEN', 'REGISTRATION_CLOSED', 'LIVE', 'COMPLETED', 'CANCELLED', 'PENDING_APPROVAL') DEFAULT 'DRAFT',
+        created_by VARCHAR(36) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        FOREIGN KEY (game_id) REFERENCES games(id),
+        FOREIGN KEY (created_by) REFERENCES users(id),
+        INDEX idx_slug (slug),
+        INDEX idx_status (status),
+        INDEX idx_game (game_id),
+        INDEX idx_start (tournament_start)
+      )
+    `);
+
+
+    // Normalize an existing tournament table created by an older build.
+    await connection.query(`ALTER TABLE tournaments MODIFY COLUMN status ENUM('DRAFT','UPCOMING','REGISTRATION_OPEN','REGISTRATION_CLOSED','LIVE','COMPLETED','CANCELLED','PENDING_APPROVAL') NOT NULL DEFAULT 'DRAFT'`);
+    await connection.query(`ALTER TABLE tournaments MODIFY COLUMN currency VARCHAR(3) NOT NULL DEFAULT 'PKR'`);
+    await connection.query(`UPDATE tournaments SET currency='PKR' WHERE currency IS NULL OR currency='' OR currency='USD'`);
+
+    // Free Fire-specific tournament columns. This also upgrades an older ZyroBattle schema safely.
+    await ensureColumn(connection, 'tournaments', 'mode', "VARCHAR(10) NOT NULL DEFAULT 'SQUAD'");
+    await ensureColumn(connection, 'tournaments', 'max_participants', "INT NOT NULL DEFAULT 32");
+    await ensureColumn(connection, 'tournaments', 'tournament_date', "TIMESTAMP NULL");
+    await ensureColumn(connection, 'tournaments', 'match_start_time', "TIMESTAMP NULL");
+    await ensureColumn(connection, 'tournaments', 'timezone', "VARCHAR(64) NOT NULL DEFAULT 'UTC'");
+    await ensureColumn(connection, 'tournaments', 'map', "VARCHAR(100) NOT NULL DEFAULT 'Bermuda'");
+    await ensureColumn(connection, 'tournaments', 'match_number', "INT NOT NULL DEFAULT 1");
+    await ensureColumn(connection, 'tournaments', 'round', "VARCHAR(100) NOT NULL DEFAULT 'Round 1'");
+    await ensureColumn(connection, 'tournaments', 'kill_points', "DECIMAL(10,2) NOT NULL DEFAULT 1");
+    await ensureColumn(connection, 'tournaments', 'placement_points', "TEXT NULL");
+    await ensureColumn(connection, 'tournaments', 'room_release_time', "VARCHAR(20) NOT NULL DEFAULT 'IMMEDIATE'");
+    await ensureColumn(connection, 'tournaments', 'room_id', "VARCHAR(100) NULL");
+    await ensureColumn(connection, 'tournaments', 'room_password', "VARCHAR(100) NULL");
+    await ensureColumn(connection, 'tournaments', 'whatsapp_announcement_sent', "BOOLEAN NOT NULL DEFAULT FALSE");
+
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS tournament_results (
+        id VARCHAR(36) PRIMARY KEY,
+        tournament_id VARCHAR(36) NOT NULL,
+        participant_type ENUM('PLAYER','TEAM') NOT NULL,
+        participant_id VARCHAR(36) NOT NULL,
+        participant_name VARCHAR(255) NOT NULL,
+        placement INT NOT NULL,
+        prize_rupees DECIMAL(12,2) NOT NULL DEFAULT 0,
+        coins_awarded DECIMAL(12,2) NOT NULL DEFAULT 0,
+        created_by VARCHAR(36) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY unique_tournament_result (tournament_id, participant_type, participant_id),
+        FOREIGN KEY (tournament_id) REFERENCES tournaments(id) ON DELETE CASCADE,
+        FOREIGN KEY (created_by) REFERENCES users(id)
+      )
+    `);
+
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS tournament_participants (
+        id VARCHAR(36) PRIMARY KEY,
+        tournament_id VARCHAR(36) NOT NULL,
+        user_id VARCHAR(36),
+        registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        status ENUM('REGISTERED', 'APPROVED', 'REJECTED', 'WITHDRAWN') DEFAULT 'REGISTERED',
+        ign VARCHAR(100) NOT NULL,
+        free_fire_uid VARCHAR(100) NOT NULL,
+        player_username VARCHAR(100) NOT NULL,
+        teammate1_ign VARCHAR(100) NULL,
+        teammate1_uid VARCHAR(100) NULL,
+        teammate2_ign VARCHAR(100) NULL,
+        teammate2_uid VARCHAR(100) NULL,
+        teammate3_ign VARCHAR(100) NULL,
+        teammate3_uid VARCHAR(100) NULL,
+        FOREIGN KEY (tournament_id) REFERENCES tournaments(id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        UNIQUE KEY unique_tournament_user (tournament_id, user_id)
+      )
+    `);
+
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS matches (
+        id VARCHAR(36) PRIMARY KEY,
+        tournament_id VARCHAR(36) NOT NULL,
+        round INT NOT NULL DEFAULT 1,
+        round_name VARCHAR(100),
+        team_a_id VARCHAR(36),
+        team_b_id VARCHAR(36),
+        team_a_name VARCHAR(255),
+        team_b_name VARCHAR(255),
+        scheduled_time TIMESTAMP NULL,
+        room_id VARCHAR(100),
+        room_password VARCHAR(100),
+        status ENUM('UPCOMING', 'LIVE', 'COMPLETED', 'DISPUTED', 'CANCELLED') DEFAULT 'UPCOMING',
+        score_a INT DEFAULT 0,
+        score_b INT DEFAULT 0,
+        winner_id VARCHAR(36),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        FOREIGN KEY (tournament_id) REFERENCES tournaments(id) ON DELETE CASCADE,
+        INDEX idx_tournament (tournament_id),
+        INDEX idx_status (status),
+        INDEX idx_scheduled (scheduled_time)
+      )
+    `);
+
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS match_results (
+        id VARCHAR(36) PRIMARY KEY,
+        match_id VARCHAR(36) NOT NULL,
+        submitted_by VARCHAR(36) NOT NULL,
+        winner_id VARCHAR(36) NOT NULL,
+        score_a INT NOT NULL,
+        score_b INT NOT NULL,
+        evidence_url TEXT,
+        notes TEXT,
+        status ENUM('PENDING', 'APPROVED', 'REJECTED', 'DISPUTED') DEFAULT 'PENDING',
+        verified_by VARCHAR(36),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        FOREIGN KEY (match_id) REFERENCES matches(id) ON DELETE CASCADE,
+        FOREIGN KEY (submitted_by) REFERENCES users(id),
+        FOREIGN KEY (verified_by) REFERENCES users(id)
+      )
+    `);
+
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS notifications (
+        id VARCHAR(36) PRIMARY KEY,
+        user_id VARCHAR(36) NOT NULL,
+        type ENUM('TOURNAMENT', 'MATCH', 'TEAM', 'SYSTEM', 'RESULT') NOT NULL,
+        title VARCHAR(255) NOT NULL,
+        message TEXT,
+        link VARCHAR(500),
+        is_read BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        INDEX idx_user (user_id),
+        INDEX idx_read (is_read)
+      )
+    `);
+
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS announcements (
+        id VARCHAR(36) PRIMARY KEY,
+        tournament_id VARCHAR(36) NOT NULL,
+        title VARCHAR(255) NOT NULL,
+        content TEXT NOT NULL,
+        author_id VARCHAR(36) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (tournament_id) REFERENCES tournaments(id) ON DELETE CASCADE,
+        FOREIGN KEY (author_id) REFERENCES users(id)
+      )
+    `);
+
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS reports (
+        id VARCHAR(36) PRIMARY KEY,
+        reporter_id VARCHAR(36) NOT NULL,
+        target_type VARCHAR(50) NOT NULL,
+        target_id VARCHAR(36) NOT NULL,
+        reason VARCHAR(255) NOT NULL,
+        description TEXT,
+        evidence_url TEXT,
+        status ENUM('OPEN', 'INVESTIGATING', 'RESOLVED', 'REJECTED') DEFAULT 'OPEN',
+        admin_notes TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        FOREIGN KEY (reporter_id) REFERENCES users(id)
+      )
+    `);
+
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS admin_logs (
+        id VARCHAR(36) PRIMARY KEY,
+        admin_id VARCHAR(36) NOT NULL,
+        action VARCHAR(100) NOT NULL,
+        target_type VARCHAR(50),
+        target_id VARCHAR(36),
+        metadata JSON,
+        ip_address VARCHAR(45),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (admin_id) REFERENCES users(id),
+        INDEX idx_admin (admin_id),
+        INDEX idx_action (action)
+      )
+    `);
+
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS payments (
+        id VARCHAR(36) PRIMARY KEY,
+        user_id VARCHAR(36) NOT NULL,
+        tournament_id VARCHAR(36),
+        amount DECIMAL(10,2) NOT NULL,
+        currency VARCHAR(3) DEFAULT 'PKR',
+        status ENUM('PENDING', 'PAID', 'FAILED', 'REFUNDED') DEFAULT 'PENDING',
+        provider VARCHAR(50),
+        transaction_ref VARCHAR(255),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id),
+        FOREIGN KEY (tournament_id) REFERENCES tournaments(id)
+      )
+    `);
+
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS seasons (
+        id VARCHAR(36) PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        start_date DATE NOT NULL,
+        end_date DATE NOT NULL,
+        status ENUM('ACTIVE', 'COMPLETED', 'UPCOMING') DEFAULT 'UPCOMING',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS whatsapp_config (
+        id INT PRIMARY KEY,
+        status VARCHAR(30) NOT NULL DEFAULT 'DISCONNECTED',
+        connected_at TIMESTAMP NULL,
+        phone_number VARCHAR(40) NULL,
+        destination_id VARCHAR(255) NULL,
+        destination_name VARCHAR(255) NULL,
+        destination_type VARCHAR(20) NULL,
+        enabled BOOLEAN NOT NULL DEFAULT FALSE,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )
+    `);
+    await connection.query(`INSERT IGNORE INTO whatsapp_config (id) VALUES (1)`);
+
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS whatsapp_messages (
+        id VARCHAR(36) PRIMARY KEY,
+        event_type VARCHAR(50) NOT NULL,
+        tournament_id VARCHAR(36) NULL,
+        tournament_name VARCHAR(255) NULL,
+        message TEXT NOT NULL,
+        destination VARCHAR(255) NULL,
+        whatsapp_message_id VARCHAR(100) NULL,
+        status VARCHAR(20) NOT NULL,
+        error TEXT NULL,
+        sent_at TIMESTAMP NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Add whatsapp_message_id column to existing tables if missing
+    try {
+      await connection.query(`
+        ALTER TABLE whatsapp_messages 
+        ADD COLUMN IF NOT EXISTS whatsapp_message_id VARCHAR(100) NULL
+        AFTER destination
+      `);
+    } catch (e) {
+      console.log('[MIGRATE] whatsapp_message_id column may already exist:', e);
+    }
+
+    console.log('[MIGRATE] All migrations completed successfully');
+  } finally {
+    connection.release();
+  }
+}
+
+export async function seedDatabase(): Promise<void> {
+  const pool = getPool();
+  const connection = await pool.getConnection();
+
+  try {
+    console.log('[SEED] Seeding database...');
+
+    // Seed games
+    const games = [
+      ['free-fire', 'Free Fire', 'free-fire', '🔥', 'Free Fire esports tournament'],
+    ];
+
+    for (const g of games) {
+      await connection.query(
+        'INSERT IGNORE INTO games (id, name, slug, icon, description) VALUES (?, ?, ?, ?, ?)',
+        g
+      );
+    }
+
+    console.log('[SEED] Database seeded successfully');
+  } finally {
+    connection.release();
+  }
+}

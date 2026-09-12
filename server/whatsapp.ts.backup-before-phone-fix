@@ -1,0 +1,236 @@
+import fs from 'fs';
+import path from 'path';
+import QRCode from 'qrcode';
+import pino from 'pino';
+import makeWASocket, { DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
+import { getPool } from './database/index.js';
+
+export type WhatsAppChat = {
+  id: string;
+  name: string;
+  type: 'GROUP' | 'CHANNEL' | 'CHAT';
+  unreadCount: number;
+};
+
+type Status = 'DISCONNECTED' | 'CONNECTING' | 'QR_REQUIRED' | 'CONNECTED' | 'ERROR';
+
+let sock: any = null;
+let qrDataUrl: string | null = null;
+let status: Status = 'DISCONNECTED';
+let phoneNumber: string | null = null;
+let connectedAt: string | null = null;
+let lastError: string | null = null;
+let chats: WhatsAppChat[] = [];
+let selectedDestination: WhatsAppChat | null = null;
+let lastChatsRefreshAt = 0;
+let chatsRefreshInFlight: Promise<void> | null = null;
+
+const sessionPath = path.resolve(process.env.WHATSAPP_SESSION_PATH || './whatsapp-session');
+const logger = pino({ level: process.env.WHATSAPP_LOG_LEVEL || 'warn' });
+
+function normalizeChat(id: string, name: string, type: WhatsAppChat['type']): WhatsAppChat {
+  return { id, name: name || id, type, unreadCount: 0 };
+}
+
+async function persistWhatsAppStatus(extra: Partial<{status: Status; phoneNumber: string|null; connectedAt: string|null}> = {}) {
+  try {
+    const pool = getPool();
+    await pool.query(
+      `UPDATE whatsapp_config SET status=?,connected_at=?,enabled=? WHERE id=1`,
+      [extra.status ?? status, extra.phoneNumber ?? phoneNumber, extra.connectedAt ?? connectedAt, (extra.status ?? status) === 'CONNECTED']
+    );
+  } catch {}
+}
+
+async function refreshChats(force = false) {
+  if (!sock) return;
+  const now = Date.now();
+  if (!force && now - lastChatsRefreshAt < 30_000) return;
+  if (chatsRefreshInFlight) return chatsRefreshInFlight;
+  chatsRefreshInFlight = (async () => {
+    const next = new Map<string, WhatsAppChat>();
+
+  try {
+    const groups = await sock.groupFetchAllParticipating();
+    for (const [id, group] of Object.entries<any>(groups || {})) {
+      next.set(id, normalizeChat(id, group.subject || id, 'GROUP'));
+    }
+  } catch (e) {
+    console.warn('[WHATSAPP] Could not load groups:', e instanceof Error ? e.message : e);
+  }
+
+  // Newer Baileys versions expose newsletter/channel metadata. Use it when available;
+  // WhatsApp channels are represented by @newsletter JIDs.
+  try {
+    const newsletters = await sock.newsletterList?.();
+    for (const channel of (newsletters || [])) {
+      const id = channel?.id || channel?.jid;
+      if (id) next.set(id, normalizeChat(id, channel.name || channel.subject || id, 'CHANNEL'));
+    }
+  } catch (e) {
+    console.warn('[WHATSAPP] Could not load channels:', e instanceof Error ? e.message : e);
+  }
+
+  // Baileys emits synced messages/contacts as the connection initializes.
+  // Keep every chat ID observed by the session, while groups are always refreshed above.
+  for (const chat of chats) next.set(chat.id, chat);
+    chats = Array.from(next.values()).sort((a, b) => a.name.localeCompare(b.name));
+    lastChatsRefreshAt = Date.now();
+  })();
+  try { await chatsRefreshInFlight; } finally { chatsRefreshInFlight = null; }
+}
+
+export async function startWhatsApp() {
+  await restoreWhatsAppDestination();
+  if (status === 'CONNECTED' || status === 'CONNECTING' || status === 'QR_REQUIRED') return;
+
+  fs.mkdirSync(sessionPath, { recursive: true });
+  status = 'CONNECTING';
+  qrDataUrl = null;
+  lastError = null;
+
+  const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+  let version: any;
+  try { ({ version } = await fetchLatestBaileysVersion()); } catch { version = undefined; }
+
+  sock = makeWASocket({
+    auth: state,
+    version,
+    logger,
+    printQRInTerminal: false,
+    markOnlineOnConnect: false,
+    browser: ['ZyroBattle', 'Chrome', '1.0.0'],
+  } as any);
+
+  sock.ev.on('creds.update', saveCreds);
+
+  sock.ev.on('connection.update', async (update: any) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      qrDataUrl = await QRCode.toDataURL(qr, { margin: 1, width: 320 });
+      status = 'QR_REQUIRED';
+      await persistWhatsAppStatus({ status });
+    }
+
+    if (connection === 'open') {
+      status = 'CONNECTED';
+      qrDataUrl = null;
+      lastError = null;
+      connectedAt = new Date().toISOString();
+      phoneNumber = sock?.user?.id?.split(':')[0] || null;
+      await refreshChats(true);
+      await persistWhatsAppStatus({ status, phoneNumber, connectedAt });
+      console.log('[WHATSAPP] Connected:', phoneNumber || 'unknown');
+    }
+
+    if (connection === 'close') {
+      const code = lastDisconnect?.error?.output?.statusCode;
+      sock = null;
+      qrDataUrl = null;
+      lastChatsRefreshAt = 0;
+
+      if (code === DisconnectReason.loggedOut) {
+        status = 'DISCONNECTED';
+        lastError = 'WhatsApp session was logged out. Scan a new QR code to reconnect.';
+        await persistWhatsAppStatus({ status, phoneNumber: null, connectedAt: null });
+      } else {
+        status = 'DISCONNECTED';
+        await persistWhatsAppStatus({ status, phoneNumber: null, connectedAt: null });
+        setTimeout(() => { if (status === 'DISCONNECTED') startWhatsApp().catch(console.error); }, 3000);
+      }
+    }
+  });
+
+  const upsertChats = (items: any[]) => {
+    const map = new Map(chats.map(c => [c.id, c]));
+    for (const c of items || []) {
+      if (!c?.id) continue;
+      const type = c.id.endsWith('@g.us') ? 'GROUP' : c.id.endsWith('@newsletter') ? 'CHANNEL' : 'CHAT';
+      const previous = map.get(c.id);
+      map.set(c.id, normalizeChat(c.id, c.name || c.subject || c.notify || previous?.name || c.id, type));
+    }
+    chats = Array.from(map.values()).sort((a,b) => a.name.localeCompare(b.name));
+  };
+
+  sock.ev.on('contacts.upsert', (contacts: any[]) => upsertChats(contacts));
+  sock.ev.on('contacts.update', (contacts: any[]) => upsertChats(contacts));
+  sock.ev.on('chats.set', ({ chats: incoming }: any) => upsertChats(incoming));
+  sock.ev.on('chats.upsert', (incoming: any[]) => upsertChats(incoming));
+  sock.ev.on('chats.update', (incoming: any[]) => upsertChats(incoming));
+  sock.ev.on('messaging-history.set', ({ chats: historyChats, contacts }: any) => {
+    upsertChats(historyChats);
+    upsertChats(contacts);
+  });
+
+  sock.ev.on('messages.upsert', ({ messages }: any) => {
+    const observed = (messages || []).map((m: any) => ({ id: m?.key?.remoteJid, name: m?.pushName || m?.key?.remoteJid }));
+    upsertChats(observed);
+  });
+}
+
+export async function disconnectWhatsApp(logout = false) {
+  try {
+    if (sock) {
+      if (logout) await sock.logout();
+      else sock.end(undefined);
+    }
+  } catch {}
+  sock = null;
+  status = 'DISCONNECTED';
+  qrDataUrl = null;
+  phoneNumber = null;
+  connectedAt = null;
+  if (logout) {
+    try { fs.rmSync(sessionPath, { recursive: true, force: true }); } catch {}
+  }
+}
+
+export async function listWhatsAppChats(): Promise<WhatsAppChat[]> {
+  if (status === 'CONNECTED') await refreshChats();
+  return chats;
+}
+
+export function getWhatsAppStatus() {
+  return { status, qr: qrDataUrl, phoneNumber, connectedAt, lastError, destination: selectedDestination };
+}
+
+export function selectWhatsAppDestination(destination: WhatsAppChat | null) {
+  selectedDestination = destination;
+}
+
+export function getWhatsAppDestination() { return selectedDestination; }
+
+export async function restoreWhatsAppDestination() {
+  try {
+    const pool = getPool();
+    const [rows] = await pool.query<any[]>('SELECT destination_id,destination_name,destination_type FROM whatsapp_config WHERE id=1');
+    const row = rows[0];
+    if (row?.destination_id) selectedDestination = { id: row.destination_id, name: row.destination_name || row.destination_id, type: row.destination_type || 'GROUP', unreadCount: 0 };
+  } catch {}
+}
+
+export function normalizeWhatsAppPhone(value: string): string {
+  let digits = String(value || '').replace(/[^0-9]/g, '');
+  if (digits.startsWith('00')) digits = digits.slice(2);
+  if (digits.startsWith('0')) digits = `92${digits.slice(1)}`;
+  if (!digits.startsWith('92') && digits.length === 10) digits = `92${digits}`;
+  return digits;
+}
+
+export async function sendWhatsAppDirectMessage(phone: string, text: string) {
+  if (!sock || status !== 'CONNECTED') throw new Error('WhatsApp admin account is not connected');
+  const digits = normalizeWhatsAppPhone(phone);
+  if (!/^\d{10,15}$/.test(digits)) throw new Error('Invalid WhatsApp phone number');
+  const jid = `${digits}@s.whatsapp.net`;
+  await sock.sendMessage(jid, { text });
+  return { phoneNumber: digits };
+}
+
+export async function sendWhatsAppMessage(text: string, destinationId?: string) {
+  if (!sock || status !== 'CONNECTED') throw new Error('WhatsApp is not connected');
+  const jid = destinationId || selectedDestination?.id;
+  if (!jid) throw new Error('No WhatsApp group/channel selected');
+  await sock.sendMessage(jid, { text });
+  return { destinationId: jid };
+}
